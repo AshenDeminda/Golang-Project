@@ -144,7 +144,9 @@ func TestClusterAutoPrune(t *testing.T) {
 			fi, wantMin)
 	}
 
-	// -------- cluster still usable after prune ----
+	// -------- cluster still usable after ss ----
+	
+	// -------- cluster still usable after ss ----
 	if _, ok := leader.Propose(kv.SetCmd{Key: "tail", Value: "ok"}); !ok {
 		t.Fatalf("post-prune propose failed")
 	}

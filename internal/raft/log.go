@@ -131,6 +131,13 @@ func (l *boltLog) TruncateBefore(index int) {
 			_ = c.Delete()
 		}
 
+		// Update the base index in memory and in persistent storage
+		l.base = uint64(index)
+		meta := tx.Bucket([]byte("meta"))
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], l.base)
+		_ = meta.Put([]byte("firstIndex"), buf[:])
+		
 		return nil
 	})
 }

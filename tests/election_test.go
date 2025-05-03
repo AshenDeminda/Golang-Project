@@ -25,7 +25,16 @@ func TestLeaderFailover(t *testing.T) {
 		t.Fatalf("no leader elected")
 	}
 
+	// Properly clean up leader before killing it
+	applyCh := ldr.ApplyCh()
 	killNode(ldr) // crash leader
+	
+	// Drain the apply channel to prevent goroutine leaks
+	go func() {
+		for range applyCh {
+			// Drain until closed
+		}
+	}()
 
 	// restart old node (returns as follower)
 	nodes[ldrIdx] = restartNode(t, nodes[ldrIdx])
@@ -62,7 +71,17 @@ func TestFollowerCatchUp(t *testing.T) {
 	}
 
 	fIdx, follower := firstFollower(nodes)
+	
+	// Get and save the follower's ApplyCh for proper draining
+	applyCh := follower.ApplyCh()
 	killNode(follower) // take follower down
+	
+	// Drain the channel to prevent leaks
+	go func() {
+		for range applyCh {
+			// Drain until closed
+		}
+	}()
 
 	// leader keeps working
 	for i := 0; i < 10; i++ {
@@ -81,7 +100,10 @@ func TestFollowerCatchUp(t *testing.T) {
 func TestLeaderRestartWithDisk(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "solo.bolt")
-	db, _ := bolt.Open(dbPath, 0600, nil)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("failed to open bolt DB: %v", err)
+	}
 
 	applyCh := make(chan raft.ApplyMsg, 128)
 	node := raft.NewNode("solo", nil, applyCh, db)
@@ -108,11 +130,25 @@ func TestLeaderRestartWithDisk(t *testing.T) {
 	for node.LastApplied() < idx {
 		time.Sleep(10 * time.Millisecond)
 	}
+	
+	// Properly drain the apply channel
+	drainCh := applyCh
 	node.Stop()
+	
+	go func() {
+		for range drainCh {
+			// Drain until closed
+		}
+	}()
+	
 	db.Close()
 
 	// ---------- restart -------------------------------
-	db2, _ := bolt.Open(dbPath, 0600, nil)
+	db2, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("failed to reopen bolt DB: %v", err)
+	}
+	
 	applyCh2 := make(chan raft.ApplyMsg, 128)
 	node2 := raft.NewNode("solo", nil, applyCh2, db2)
 	go node2.Start()
@@ -122,6 +158,14 @@ func TestLeaderRestartWithDisk(t *testing.T) {
 	if node2.LastApplied() < idx {
 		t.Fatalf("persisted entry missing after restart")
 	}
+	
+	node2.Stop()
+	go func() {
+		for range applyCh2 {
+			// Drain until closed
+		}
+	}()
+	
 	db2.Close()
 }
 
@@ -153,6 +197,9 @@ func waitApplyAll(t *testing.T, ns []*raft.Node, want int) {
 	t.Helper()
 	dead := time.Now().Add(5 * time.Second)
 	for _, n := range ns {
+		if n == nil {
+			continue // Skip nil nodes
+		}
 		for n.LastApplied() < want {
 			if time.Now().After(dead) {
 				t.Fatalf("node %s stuck at %d/%d",
@@ -163,19 +210,36 @@ func waitApplyAll(t *testing.T, ns []*raft.Node, want int) {
 	}
 }
 
-func killNode(n *raft.Node) { n.Stop() }
+func killNode(n *raft.Node) { 
+	n.Stop() 
+}
 
 func restartNode(t *testing.T, old *raft.Node) *raft.Node {
 	t.Helper()
 
-	// drain the old ApplyCh until the sender closes it.
+	// Get DB and ID before operations that might make old unavailable
+	db := old.GetDB()
+	id := old.ID()
+	peers := old.PeersCopy()
+	
+	// Save apply channel for draining
+	oldCh := old.ApplyCh()
+	
+	// Stop the old node
+	old.Stop()
+
+	// Drain the old ApplyCh until the sender closes it
 	go func(ch <-chan raft.ApplyMsg) {
 		for range ch {
+			// Drain until closed
 		}
-	}(old.ApplyCh())
+	}(oldCh)
+
+	// Allow time for cleanup
+	time.Sleep(100 * time.Millisecond)
 
 	newCh := make(chan raft.ApplyMsg, 256)
-	newN := raft.NewNode(old.ID(), old.PeersCopy(), newCh, old.GetDB())
+	newN := raft.NewNode(id, peers, newCh, db)
 	go newN.Start()
 	return newN
 }

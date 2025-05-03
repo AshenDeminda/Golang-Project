@@ -23,8 +23,13 @@ func pickNPorts(n int) ([]int, error) {
 		if err != nil {
 			return nil, err
 		}
-		port := ln.Addr().(*net.TCPAddr).Port
-		_ = ln.Close()
+		addr, ok := ln.Addr().(*net.TCPAddr)
+		if !ok {
+			ln.Close()
+			return nil, fmt.Errorf("expected TCPAddr, got %T", ln.Addr())
+		}
+		port := addr.Port
+		ln.Close()
 		ports = append(ports, port)
 	}
 	return ports, nil
@@ -33,6 +38,38 @@ func pickNPorts(n int) ([]int, error) {
 // buildCluster spins up N raft nodes each with its own BoltDB file in a temp dir.
 func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 	t.Helper()
+
+	// Prepare resource tracking for cleanup
+	var resources struct {
+		nodes []*raft.Node
+		dbs   []*bolt.DB
+		httpServers []*http.Server
+	}
+	
+	// Define cleanup function that can be called at any point
+	cleanup := func() {
+		// Stop all HTTP servers
+		for _, server := range resources.httpServers {
+			if server != nil {
+				// Use a context with timeout if in production code
+				server.Close()
+			}
+		}
+		
+		// Stop all nodes
+		for _, n := range resources.nodes {
+			if n != nil {
+				n.Stop()
+			}
+		}
+		
+		// Close all DBs
+		for _, db := range resources.dbs {
+			if db != nil {
+				db.Close()
+			}
+		}
+	}
 
 	ports, err := pickNPorts(n)
 	if err != nil {
@@ -45,10 +82,12 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 		addrs[fmt.Sprintf("node%d", i+1)] = fmt.Sprintf("localhost:%d", ports[i])
 	}
 
-	nodes := make([]*raft.Node, 0, n)
-	dbs := make([]*bolt.DB, 0, n)
-
-	for id, addr := range addrs {
+	nodes := make([]*raft.Node, n)
+	
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("node%d", i+1)
+		addr := addrs[id]
+		
 		// peer map ----------------------------------------------------
 		peers := make(map[string]string)
 		for pid, paddr := range addrs {
@@ -61,13 +100,16 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 		dbPath := filepath.Join(t.TempDir(), id+".bolt")
 		db, err := bolt.Open(dbPath, 0600, nil)
 		if err != nil {
+			cleanup() // Clean up resources allocated so far
 			t.Fatalf("open bolt: %v", err)
 		}
-		dbs = append(dbs, db)
+		resources.dbs = append(resources.dbs, db)
 
 		// raft node ---------------------------------------------------
 		applyCh := make(chan raft.ApplyMsg, 128)
 		node := raft.NewNode(id, peers, applyCh, db)
+		nodes[i] = node
+		resources.nodes = append(resources.nodes, node)
 
 		// drain applyCh so it never blocks ---------------------------
 		go func(ch <-chan raft.ApplyMsg) {
@@ -75,31 +117,25 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 			}
 		}(applyCh)
 
-		// start HTTP listener ----------------------------------------
+		// start HTTP listener with proper error handling -------------
 		go func(n *raft.Node, addr string) {
 			n.Start()
 			mux := http.NewServeMux()
 			mux.Handle("/raft/", http.StripPrefix("/raft", node.Trans()))
-			log.Fatal(http.ListenAndServe(addr, mux))
-		}(node, addr)
-
-		nodes = append(nodes, node)
-	}
-
-	// graceful shutdown ---------------------------------------------
-	stop := func() {
-		for _, n := range nodes {
-			if n == nil {
-				continue
+			
+			server := &http.Server{
+				Addr:    addr,
+				Handler: mux,
 			}
-			n.Stop()
-		}
-		for _, db := range dbs {
-			db.Close()
-		}
+			resources.httpServers = append(resources.httpServers, server)
+			
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("HTTP server for node %s failed: %v", n.ID(), err)
+			}
+		}(node, addr)
 	}
 
-	return nodes, stop
+	return nodes, cleanup
 }
 
 // --------------------------------------------------
@@ -112,7 +148,7 @@ func TestEndToEndReplication(t *testing.T) {
 	time.Sleep(4 * time.Second) // allow election
 	var leader *raft.Node
 	for _, n := range nodes {
-		if n.State() == raft.Leader {
+		if n != nil && n.State() == raft.Leader {
 			leader = n
 			break
 		}
@@ -133,6 +169,9 @@ func TestEndToEndReplication(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
 		id := n.ID()
 		for n.LastApplied() < idx {
 			if time.Now().After(deadline) {
@@ -153,7 +192,7 @@ func TestConcurrentWrites(t *testing.T) {
 
 	var leader *raft.Node
 	for _, n := range nodes {
-		if n.State() == raft.Leader {
+		if n != nil && n.State() == raft.Leader {
 			leader = n
 			break
 		}
@@ -163,6 +202,8 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 
 	entry_count := 1000
+	var errMutex sync.Mutex
+	var errors []string
 
 	var wg sync.WaitGroup
 	for i := 0; i < entry_count; i++ {
@@ -170,20 +211,32 @@ func TestConcurrentWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			if _, ok := leader.Propose(kv.SetCmd{Key: fmt.Sprintf("k%02d", i), Value: "x"}); !ok {
-				t.Errorf("propose %d failed", i)
+				errMutex.Lock()
+				errors = append(errors, fmt.Sprintf("propose %d failed", i))
+				errMutex.Unlock()
 			}
 		}(i)
+		// Small delay to prevent overwhelming the system
 		time.Sleep(10 * time.Millisecond)
 	}
 	wg.Wait()
+	
+	// Report collected errors
+	for _, err := range errors {
+		t.Errorf("%s", err)
+	}
 
-	// wait for all nodes to apply the entry
+	// wait for all nodes to apply the entries
 	deadline := time.Now().Add(20 * time.Second)
 	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
 		id := n.ID()
 		for n.LastApplied() < entry_count {
 			if time.Now().After(deadline) {
-				t.Fatalf("node %s did not apply all entries", id)
+				t.Fatalf("node %s did not apply all entries, applied %d/%d", 
+					id, n.LastApplied(), entry_count)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

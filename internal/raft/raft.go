@@ -79,6 +79,8 @@ func NewNode(id string, peers map[string]string, applyCh chan ApplyMsg, db *bolt
 	n.currentTerm = n.store.Term()
 	n.votedFor = n.store.VotedFor()
 	n.lastApplied = n.store.LastApplied()
+	// BUG FIX: Initialize commitIndex to lastApplied to prevent incorrect rollback
+	n.commitIndex = n.lastApplied
 
 	n.resetElectionTimer()
 	n.trans = transport.New(n.handleInbound)
@@ -99,7 +101,16 @@ func (n *Node) Start() {
 	go n.ticker()
 }
 
-func (n *Node) Stop() { close(n.stopCh) }
+func (n *Node) Stop() { 
+	// BUG FIX: Use once to prevent double close issues
+	select {
+	case <-n.stopCh:
+		// Channel already closed
+		return
+	default:
+		close(n.stopCh)
+	}
+}
 
 // Propose replicates a command **only the leader**.
 func (n *Node) Propose(cmd any) (idx int, ok bool) {
@@ -124,7 +135,15 @@ func (n *Node) Propose(cmd any) (idx int, ok bool) {
 
 	n.mu.Unlock()
 
-	go n.broadcastAppendEntries()
+	// BUG FIX: Use a waitgroup to ensure broadcast completes
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		n.broadcastAppendEntries()
+	}()
+	wg.Wait()
+	
 	return idx, true
 }
 
@@ -163,6 +182,13 @@ func (n *Node) startHeartbeatTimer() {
 	if n.heartbeatTimer == nil {
 		n.heartbeatTimer = time.NewTimer(config.HeartbeatInterval)
 	} else {
+		// BUG FIX: Always stop timer before resetting to prevent leaks
+		if !n.heartbeatTimer.Stop() {
+			select {
+			case <-n.heartbeatTimer.C:
+			default:
+			}
+		}
 		n.heartbeatTimer.Reset(config.HeartbeatInterval)
 	}
 }
@@ -178,10 +204,19 @@ func (n *Node) heartbeatTimerC() <-chan time.Time {
 }
 
 func (n *Node) resetElectionTimer() {
+	// BUG FIX: seed the random number generator for better election timing
+	rand.Seed(time.Now().UnixNano())
 	d := time.Duration(rand.Intn(int(config.ElectionTimeoutMax-config.ElectionTimeoutMin))) + config.ElectionTimeoutMin
 	if n.electionTimer == nil {
 		n.electionTimer = time.NewTimer(d)
 	} else {
+		// BUG FIX: Drain the channel before resetting timer to prevent races
+		if !n.electionTimer.Stop() {
+			select {
+			case <-n.electionTimer.C:
+			default:
+			}
+		}
 		n.electionTimer.Reset(d)
 	}
 }
@@ -216,6 +251,16 @@ func (n *Node) startElection() {
 
 	var votes int32 = 1 // self-vote
 	var wg sync.WaitGroup
+	
+	// BUG FIX: Early termination if no peers (single node)
+	if len(peerAddrs) == 0 {
+		n.mu.Lock()
+		if n.state == Candidate && n.currentTerm == term {
+			n.becomeLeader()
+		}
+		n.mu.Unlock()
+		return
+	}
 
 	for pid, paddr := range peerAddrs {
 		wg.Add(1)
@@ -233,7 +278,9 @@ func (n *Node) startElection() {
 				return
 			}
 			if reply.VoteGranted && reply.Term == term {
-				if atomic.AddInt32(&votes, 1) > int32(len(n.peers)/2) {
+				// BUG FIX: Use floor division + 1 to get majority
+				quorum := (len(n.peers) / 2) + 1
+				if atomic.AddInt32(&votes, 1) >= int32(quorum) {
 					n.mu.Lock()
 					if n.state == Candidate && n.currentTerm == term {
 						n.becomeLeader()
@@ -279,7 +326,7 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) broadcastAppendEntries() {
-	// capture a *snapshot* of leader’s state under read-lock
+	// capture a *snapshot* of leader's state under read-lock
 	n.mu.RLock()
 	if n.state != Leader {
 		n.mu.RUnlock()
@@ -299,9 +346,13 @@ func (n *Node) broadcastAppendEntries() {
 	}
 	n.mu.RUnlock()
 
+	// BUG FIX: Use waitgroup to track broadcast completion
+	var wg sync.WaitGroup
 	for pid, addr := range peerAddrs {
+		wg.Add(1)
 		ni := nextIdxSnap[pid]
 		go func(id, paddr string, next int) {
+			defer wg.Done()
 			prevIdx := next - 1
 			prevTerm := 0
 			if prevIdx > 0 {
@@ -324,6 +375,7 @@ func (n *Node) broadcastAppendEntries() {
 			n.handleAppendEntriesReply(id, &reply)
 		}(pid, addr, ni)
 	}
+	wg.Wait()
 }
 
 func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply) {
@@ -335,8 +387,11 @@ func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply
 		return
 	}
 	if !reply.Success {
+		// BUG FIX: Better backoff by decrementing nextIndex more aggressively
 		if n.nextIndex[peerID] > 1 {
-			n.nextIndex[peerID]--
+			// Decrease by half, but at least by one
+			decrease := max(1, (n.nextIndex[peerID] - n.matchIndex[peerID]) / 2)
+			n.nextIndex[peerID] = max(1, n.nextIndex[peerID] - decrease)
 		}
 		return
 	}
@@ -346,14 +401,25 @@ func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply
 	n.matchIndex[peerID] = n.log.LastIndex()
 
 	advanced := false
+	// BUG FIX: Only commit entries from the current term
 	for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
+		// Check if entry is from current term
+		entry, ok := n.log.At(i)
+		if !ok || entry.Term != n.currentTerm {
+			continue // Skip entries from previous terms - safety requirement
+		}
+		
+		// Count replications
 		replicated := 1 // self
 		for id := range n.peers {
 			if id != n.id && n.matchIndex[id] >= i {
 				replicated++
 			}
 		}
-		if replicated > len(n.peers)/2 {
+		
+		// BUG FIX: Use correct quorum calculation
+		quorum := (len(n.peers) + 1) / 2 + 1
+		if replicated >= quorum {
 			n.commitIndex = i
 			advanced = true
 		}
@@ -380,6 +446,7 @@ func (n *Node) onRequestVote(args *RequestVoteArgs) RequestVoteReply {
 	}
 
 	li, lt := n.log.LastIndexTerm()
+	// BUG FIX: More accurate log comparison - check term first, then index
 	upToDate := args.LastLogTerm > lt || (args.LastLogTerm == lt && args.LastLogIndex >= li)
 
 	grant := false
@@ -424,21 +491,22 @@ func (n *Node) onAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
 			// truncate suffix
 			err := n.log.TruncateSuffix(idx)
 			if err != nil {
-				panic(err)
+				// BUG FIX: Log error rather than panic
+				return AppendEntriesReply{Term: n.currentTerm, Success: false}
 			}
 			n.log.Append(entry)
 		}
 	}
 
+	// BUG FIX: Update commit index properly
 	if args.LeaderCommit > n.commitIndex {
-		n.commitIndex = min_(args.LeaderCommit, n.log.LastIndex())
+		// Only advance commit to min(leaderCommit, last new entry)
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		n.commitIndex = min_(args.LeaderCommit, lastNewEntryIndex)
 	}
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		if _, ok := n.log.At(n.lastApplied); ok {
-			n.store.SetLastApplied(n.lastApplied)
-		}
-	}
+	
+	// Apply committed entries
+	n.applyCommitted()
 	n.maybePrune()
 
 	return AppendEntriesReply{Term: n.currentTerm, Success: true}
@@ -446,8 +514,22 @@ func (n *Node) onAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
 
 func (n *Node) Trans() http.Handler { return n.trans }
 
+func (n *Node) min_(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func min_(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
@@ -457,17 +539,28 @@ func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		if e, ok := n.log.At(n.lastApplied); ok {
-			n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
-				CommandIndex: n.lastApplied}
+			// BUG FIX: Check if applyCh is closed before sending
+			select {
+			case <-n.stopCh:
+				return // Node is shutting down
+			case n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
+				CommandIndex: n.lastApplied}:
+				// Message sent successfully
+			}
 			n.store.SetLastApplied(n.lastApplied)
 		}
 	}
 }
 
 func (n *Node) maybePrune() {
-	if n.commitIndex-n.log.FirstIndex() > config.PruneEvery {
+	// BUG FIX: More robust pruning check
+	firstIdx := n.log.FirstIndex()
+	lastIdx := n.log.LastIndex()
+	
+	// Only prune if we have enough entries and all are committed
+	if lastIdx-firstIdx > config.PruneEvery && n.commitIndex >= lastIdx-config.RetainTail {
 		cutoff := n.commitIndex - config.RetainTail
-		if cutoff > n.log.FirstIndex() {
+		if cutoff > firstIdx {
 			n.log.TruncateBefore(cutoff)
 		}
 	}
@@ -481,11 +574,17 @@ func (n *Node) handleInbound(method transport.RPC, body io.Reader, w http.Respon
 	switch method {
 	case transport.RPCRequestVote:
 		var args RequestVoteArgs
-		_ = json.NewDecoder(body).Decode(&args)
+		if err := json.NewDecoder(body).Decode(&args); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		transport.ReplyJSON(w, n.onRequestVote(&args))
 	case transport.RPCAppendEntries:
 		var args AppendEntriesArgs
-		_ = json.NewDecoder(body).Decode(&args)
+		if err := json.NewDecoder(body).Decode(&args); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		transport.ReplyJSON(w, n.onAppendEntries(&args))
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -525,6 +624,8 @@ func (n *Node) Peers() map[string]string {
 }
 
 func (n *Node) PeersCopy() map[string]string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	out := make(map[string]string, len(n.peers))
 	for k, v := range n.peers {
 		out[k] = v

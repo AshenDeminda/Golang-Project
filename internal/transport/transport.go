@@ -1,63 +1,95 @@
-package transport
+package raft
+
+// StableStore holds the Raft persistent metadata.
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
-	"net/http"
-	"time"
+	"encoding/binary"
+
+	bolt "go.etcd.io/bbolt"
 )
 
-type RPC string // RPC identifies the Raft method.
+type StableStore interface {
+	Term() int
+	SetTerm(t int)
+	VotedFor() string
+	SetVotedFor(id string)
+	LastApplied() int
+	SetLastApplied(index int)
+}
 
+// ------------------------------------------------------------
+// Bolt-backed implementation
+// ------------------------------------------------------------
 const (
-	RPCRequestVote   RPC = "request_vote"
-	RPCAppendEntries RPC = "append_entries"
+	bMeta       = "meta" // bucket name
+	kTerm       = "term"
+	kVotedFor   = "voted_for"
+	LastApplied = "last_applied"
 )
 
-// HandlerFunc handles an inbound RPC and returns response or error.
-type HandlerFunc func(method RPC, body io.Reader, w http.ResponseWriter)
+type boltStore struct{ db *bolt.DB }
 
-// HTTPTransport routes JSON‑encoded RPCs over http.Client.
-type HTTPTransport struct {
-	client  *http.Client
-	handler HandlerFunc
-}
-
-func New(handler HandlerFunc) *HTTPTransport {
-	return &HTTPTransport{
-		client:  &http.Client{Timeout: 3 * time.Second},
-		handler: handler,
-	}
-}
-
-func (t *HTTPTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t.handler(RPC(r.URL.Path[1:]), r.Body, w)
-}
-
-func (t *HTTPTransport) Call(addr string, method RPC, req, resp any) error {
-	buf, _ := json.Marshal(req)
-	httpResp, err := t.client.Post(
-		"http://"+addr+"/"+string(method),
-		"application/json",
-		bytes.NewReader(buf))
-
-	if err != nil {
+func NewBoltStore(db *bolt.DB) StableStore {
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(bMeta))
 		return err
+	}); err != nil {
+		panic(err)
 	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode != http.StatusOK {
-		return io.ErrUnexpectedEOF
-	}
-
-	return json.NewDecoder(httpResp.Body).Decode(resp)
+	return &boltStore{db: db}
 }
 
-// Utility to reply JSON.
-func ReplyJSON(w http.ResponseWriter, v any) {
-	data, _ := json.Marshal(v)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+func (s *boltStore) Term() int {
+	var t uint64
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte(bMeta)).Get([]byte(kTerm)); v != nil {
+			t = binary.BigEndian.Uint64(v)
+		}
+		return nil
+	})
+	return int(t)
+}
+
+func (s *boltStore) SetTerm(term int) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(term))
+	_ = s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bMeta)).Put([]byte(kTerm), buf[:])
+	})
+}
+
+func (s *boltStore) VotedFor() string {
+	var id string
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte(bMeta)).Get([]byte(kVotedFor)); v != nil {
+			id = string(v)
+		}
+		return nil
+	})
+	return id
+}
+
+func (s *boltStore) SetVotedFor(id string) {
+	_ = s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bMeta)).Put([]byte(kVotedFor), []byte(id))
+	})
+}
+
+func (s *boltStore) LastApplied() int {
+	var last uint64
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte(bMeta)).Get([]byte(LastApplied)); v != nil {
+			last = binary.BigEndian.Uint64(v)
+		}
+		return nil
+	})
+	return int(last)
+}
+
+func (s *boltStore) SetLastApplied(index int) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(index))
+	_ = s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bMeta)).Put([]byte(LastApplied), buf[:])
+	})
 }

@@ -32,10 +32,22 @@ func (s *Store) Close() { _ = s.db.Close() }
 /* ─────────────────── API ───────────────────────── */
 
 func (s *Store) Get(key string) string {
+	// First check cache
 	if v, ok := s.lru.get(key); ok {
 		return v
 	}
-	return ""
+
+	// If not in cache, check the database
+	var value string
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte("kv")).Get([]byte(key)); v != nil {
+			value = string(v)
+			// Update the cache with the retrieved value
+			s.lru.add(key, value)
+		}
+		return nil
+	})
+	return value
 }
 
 func (s *Store) Apply(cmd any) any {
@@ -45,11 +57,15 @@ func (s *Store) Apply(cmd any) any {
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Put([]byte(c.Key), []byte(c.Value))
 		})
+		// Update cache on Set
+		s.lru.add(c.Key, c.Value)
 
 	case DelCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Delete([]byte(c.Key))
 		})
+		// Remove from cache on Delete
+		s.lru.remove(c.Key)
 
 	case GetCmd:
 		return s.Get(c.Key)
@@ -78,6 +94,8 @@ func (c *lruCache) get(k string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	// Move accessed element to front (MRU position)
+	c.ll.MoveToFront(e)
 	return e.Value.(*entry).value, true
 }
 
@@ -87,14 +105,20 @@ func (c *lruCache) add(k, v string) {
 
 	if e, ok := c.tab[k]; ok {
 		e.Value.(*entry).value = v
+		c.ll.MoveToFront(e)
 		return
 	}
-	e := c.ll.PushBack(&entry{k, v})
+	// Add new entry to front of list
+	e := c.ll.PushFront(&entry{k, v})
 	c.tab[k] = e
-	if c.ll.Len() >= c.cap {
-		tail := c.ll.Back()
-		c.ll.Remove(tail)
-		delete(c.tab, tail.Value.(*entry).key)
+	
+	// Evict if over capacity
+	if c.ll.Len() > c.cap {
+		back := c.ll.Back()
+		if back != nil {
+			c.ll.Remove(back)
+			delete(c.tab, back.Value.(*entry).key)
+		}
 	}
 }
 
